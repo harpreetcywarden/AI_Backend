@@ -1,0 +1,123 @@
+# Django File Manager API
+
+A Django-based API for managing a hierarchical file structure stored flatly in S3,
+including user authentication, CRUD operations, move, and copy functionality.
+
+## Features
+
+*   User Registration, Login, Logout (Session-based API)
+*   Create, Read, Update (Rename), Delete Files and Folders
+*   Hierarchical structure managed in PostgreSQL Database
+*   Files stored flatly in AWS S3 using UUID-based keys
+*   Recursive deletion of folders (DB entries + S3 files)
+*   Move files/folders within the hierarchy
+*   Copy files/folders (recursively, including S3 object copies)
+*   Permissions: Users can only manage their own entries.
+*   PostgreSQL database backend
+*   Uses Django REST Framework
+
+## Setup
+
+1.  **Clone the Repository:**
+    ```bash
+    git clone <repository-url>
+    cd django_file_manager
+    ```
+
+2.  **Create and Activate Virtual Environment:**
+    ```bash
+    python -m venv venv
+    # On Windows:
+    # venv\Scripts\activate
+    # On macOS/Linux:
+    # source venv/bin/activate
+    ```
+
+3.  **Install Dependencies:**
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+4.  **Set Up AWS Secrets Manager:**
+    *   Create a secret in AWS Secrets Manager (e.g., `myproject/settings`).
+    *   Store necessary configuration as key-value pairs in the secret's JSON string. **Required:** `DATABASE_URL`. **Recommended:** `DJANGO_SECRET_KEY`, `AWS_STORAGE_BUCKET_NAME`, `AWS_S3_REGION_NAME`.
+        ```json
+        {
+          "DATABASE_URL": "postgresql://user:pass@host:port/dbname",
+          "DJANGO_SECRET_KEY": "your-strong-random-key",
+          "AWS_STORAGE_BUCKET_NAME": "your-actual-bucket-name",
+          "AWS_S3_REGION_NAME": "your-bucket-region"
+        }
+        ```
+    *   Note the **ARN** of the created secret.
+
+5.  **Set Up PostgreSQL:**
+    *   Install PostgreSQL if you haven't already.
+    *   Create a database user and a database for the project.
+        ```sql
+        -- Example psql commands:
+        CREATE USER myuser WITH PASSWORD 'mypassword';
+        CREATE DATABASE mydatabase OWNER myuser;
+        GRANT ALL PRIVILEGES ON DATABASE mydatabase TO myuser;
+        ```
+
+
+
+6.  **Set Up AWS S3:**
+    *   Create an S3 bucket in your desired region.
+    *   Create an IAM user with programmatic access and S3 permissions (GetObject, PutObject, DeleteObject, ListBucket - restrict ListBucket to prefixes if possible). Note down the Access Key ID and Secret Access Key.
+
+7.  **Configure Environment Variables:**
+    *   Copy the `.env.example` file (if provided) or create a `.env` file in the project root.
+    *   Fill in the required values:
+        *   `SECRET_KEY`: Generate a strong random string (e.g., using `python -c 'from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())'`).
+        *   `DEBUG`: Set to `True` for development, `False` for production.
+        *   `ALLOWED_HOSTS`: Comma-separated list of allowed hostnames/IPs (e.g., `127.0.0.1,localhost`).
+        *   `DATABASE_URL`: Your PostgreSQL connection string (e.g., `postgresql://myuser:mypassword@localhost:5432/mydatabase`).
+        *   `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_STORAGE_BUCKET_NAME`, `AWS_S3_REGION_NAME`.
+        *   `CORS_ALLOWED_ORIGINS`: Comma-separated list of frontend origins (e.g., `http://localhost:3000`). Or set `CORS_ALLOW_ALL_ORIGINS=True` for development only.
+
+8.  **Run Database Migrations:**
+    ```bash
+    python manage.py makemigrations users storage # Create migrations for your apps
+    python manage.py migrate                  # Apply migrations to the database
+    ```
+
+9.  **Create a Superuser (Optional, for Admin):**
+    ```bash
+    python manage.py createsuperuser
+    ```
+    (Follow prompts - use your email address)
+
+10.  **Run the Development Server:**
+    ```bash
+    python manage.py runserver
+    ```
+
+The API should now be running at `http://127.0.0.1:8000/`.
+
+## API Endpoints
+
+*   **Authentication (`/api/auth/`)**
+    *   `POST /register/`: Create a new user (email, first_name, last_name, password, password2).
+    *   `POST /login/`: Log in (email, password). Establishes a session cookie.
+    *   `POST /logout/`: Log out (Requires authentication). Clears session.
+    *   `GET /me/`: Get details of the currently logged-in user (Requires authentication).
+*   **Storage (`/api/storage/`)** (All endpoints require authentication)
+    *   `GET /entries/`: List entries. Filter by `?parent_uuid=<uuid>` or `?parent_uuid=null` (for root).
+    *   `POST /entries/`: Create a file or folder.
+        *   For folders: `{"name": "folder_name", "entry_type": "folder", "parent_uuid": "<uuid_or_null>"}`
+        *   For files: Use multipart/form-data. Include `name` (optional, derived from file), `entry_type="file"`, `parent_uuid` (optional), and the `file` itself.
+    *   `GET /entries/{uuid}/`: Retrieve details of a specific entry.
+    *   `PATCH /entries/{uuid}/`: Update an entry (currently only supports renaming: `{"name": "new_name"}`).
+    *   `DELETE /entries/{uuid}/`: Delete an entry (recursive for folders, including S3 files).
+    *   `GET /entries/{uuid}/contents/`: List the contents of a folder.
+    *   `POST /entries/{uuid}/move/`: Move an entry (`{"target_parent_uuid": "<uuid_or_null>"}`).
+    *   `POST /entries/{uuid}/copy/`: Copy an entry (`{"target_parent_uuid": "<uuid_or_null>", "new_name": "optional_new_name"}`).
+
+## Important Notes
+
+*   **Security:** The provided `SECRET_KEY` and `DEBUG=True` are for development only. Ensure these are properly configured for production. Review CORS settings for production.
+*   **Error Handling:** Robust error handling, especially around S3 operations and potential orphaned files, might require additional monitoring or cleanup scripts in a production environment.
+*   **Scalability:** Consider asynchronous tasks (e.g., using Celery) for potentially long-running operations like deep copies or large file processing if needed.
+*   **Testing:** Add unit and integration tests to ensure functionality and prevent regressions.

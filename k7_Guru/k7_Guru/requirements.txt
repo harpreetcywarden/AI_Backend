@@ -1,0 +1,12 @@
+boto3
+botocore
+dj_database_url
+Django
+djangorestframework
+python-dotenv
+djangorestframework
+psycopg2-binary
+boto3
+python-dotenv
+django-cors-headers
+dj-database-url
