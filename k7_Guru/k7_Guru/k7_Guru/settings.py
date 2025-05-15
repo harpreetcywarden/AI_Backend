@@ -3,124 +3,121 @@ import sys
 import json
 import logging
 from pathlib import Path
-from dotenv import load_dotenv
-import dj_database_url
 import boto3
+from dotenv import load_dotenv
 from botocore.exceptions import ClientError, NoCredentialsError
-from django.core.exceptions import ImproperlyConfigured # Import for clearer errors
+from django.core.exceptions import ImproperlyConfigured
 
 # --- Basic Setup ---
 BASE_DIR = Path(__file__).resolve().parent.parent
-load_dotenv(os.path.join(BASE_DIR, '.env'))
+load_dotenv(os.path.join(BASE_DIR, '.env')) # Only if you want .env for local dev when SETTINGS_SECRET_ARN is not set
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 logger = logging.getLogger(__name__)
 
+# --- Logging Configuration (Early for Secrets Manager Process) ---
+# Basic console logging until full config is loaded
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+
 # --- AWS Secrets Manager Integration ---
-SECRETS = {} # Dictionary to hold fetched secrets
-SETTINGS_SECRET_ARN = os.environ.get('SETTINGS_SECRET_ARN')
-print(f"Attempting to use Secret ARN: {SETTINGS_SECRET_ARN}") # Keep for debugging startup
+SECRETS = {}
+SETTINGS_SECRET_ARN ='arn:aws:secretsmanager:us-east-1:288761728891:secret:GURU_SECRET-WSKkCr'
+if not SETTINGS_SECRET_ARN:
+    logger.critical("SETTINGS_SECRET_ARN environment variable is not set. Cannot fetch configuration from AWS Secrets Manager.")
+    raise ImproperlyConfigured("SETTINGS_SECRET_ARN environment variable is not set.")
 
-if SETTINGS_SECRET_ARN:
-    logger.info(f"Attempting to fetch settings from AWS Secrets Manager: {SETTINGS_SECRET_ARN}")
-    # Boto3 will automatically use the IAM role if AWS keys are not configured explicitly
+logger.info(f"Attempting to fetch settings from AWS Secrets Manager using ARN: {SETTINGS_SECRET_ARN}")
+try:
     session = boto3.session.Session()
-    # Ensure correct region is specified for the Secrets Manager client
-    secrets_manager_region = SETTINGS_SECRET_ARN.split(':')[3] # Extract region from ARN generally
+    # Extract region from ARN
+    secrets_manager_region = SETTINGS_SECRET_ARN.split(':')[3]
     client = session.client(service_name='secretsmanager', region_name=secrets_manager_region)
+    get_secret_value_response = client.get_secret_value(SecretId=SETTINGS_SECRET_ARN)
 
-    try:
-        get_secret_value_response = client.get_secret_value(SecretId=SETTINGS_SECRET_ARN)
-        if 'SecretString' in get_secret_value_response:
-            secret_string = get_secret_value_response['SecretString']
-            SECRETS = json.loads(secret_string)
-            logger.info("Successfully loaded secrets from Secrets Manager.")
-        else:
-            logger.warning("SecretString not found in Secrets Manager response.")
+    if 'SecretString' in get_secret_value_response:
+        secret_string = get_secret_value_response['SecretString']
+        SECRETS = json.loads(secret_string)
+        logger.info("Successfully loaded secrets from AWS Secrets Manager.")
+    else:
+        logger.error("SecretString not found in AWS Secrets Manager response.")
+        raise ImproperlyConfigured("SecretString not found in AWS Secrets Manager response.")
 
-    except NoCredentialsError:
-        logger.error("AWS credentials not found by Boto3. Ensure IAM role is attached and configured correctly.")
-        # Decide handling: raise error or allow fallback using environment variables? Raising is safer.
-        # raise ImproperlyConfigured("AWS credentials not found for Secrets Manager access.")
-    except ClientError as e:
-        error_code = e.response.get("Error", {}).get("Code")
-        logger.error(f"Failed to retrieve secrets from Secrets Manager ({error_code}): {e}")
-        # Log but continue to allow fallbacks if desired, or raise ImproperlyConfigured
-        # raise ImproperlyConfigured(f"Could not retrieve secrets: {e}") from e
-    except json.JSONDecodeError as e:
-         logger.error(f"Failed to parse JSON from secret string: {e}")
-         # raise ImproperlyConfigured(f"Invalid JSON in secret: {e}") from e
-    except Exception as e:
-         logger.error(f"An unexpected error occurred fetching secrets: {e}")
-         # raise ImproperlyConfigured(f"Unexpected error fetching secrets: {e}") from e
-else:
-    logger.warning("SETTINGS_SECRET_ARN not set. Relying solely on environment variables or defaults.")
+except NoCredentialsError:
+    logger.error("AWS credentials not found by Boto3. Ensure IAM role is attached and configured correctly.")
+    raise ImproperlyConfigured("AWS credentials not found for Secrets Manager access.")
+except ClientError as e:
+    error_code = e.response.get("Error", {}).get("Code")
+    logger.error(f"Failed to retrieve secrets from Secrets Manager ({error_code}): {e}")
+    raise ImproperlyConfigured(f"Could not retrieve secrets from AWS Secrets Manager: {e}") from e
+except json.JSONDecodeError as e:
+    logger.error(f"Failed to parse JSON from secret string: {e}")
+    raise ImproperlyConfigured(f"Invalid JSON in secret from AWS Secrets Manager: {e}") from e
+except Exception as e: # Catch any other unexpected errors
+    logger.error(f"An unexpected error occurred fetching secrets: {e}")
+    raise ImproperlyConfigured(f"Unexpected error fetching secrets from AWS Secrets Manager: {e}") from e
 
-# --- Core Settings (Use fetched secrets, fallback to env vars, then defaults/errors) ---
+# --- Helper function to get required secrets ---
+def get_secret(key_name, is_bool=False, is_int=False, is_list=False, default_if_not_essential=None):
+    """
+    Retrieves a secret from the SECRETS dictionary.
+    Raises ImproperlyConfigured if essential and not found.
+    Handles type conversions.
+    """
+    if key_name not in SECRETS:
+        if default_if_not_essential is not None:
+            logger.warning(f"Secret '{key_name}' not found in Secrets Manager, using default: {default_if_not_essential}")
+            return default_if_not_essential
+        raise ImproperlyConfigured(f"Essential setting '{key_name}' not found in AWS Secrets Manager.")
 
-# SECRET_KEY: Required - Fetch from secrets, fallback to env var, raise error if missing
-SECRET_KEY = SECRETS.get('DJANGO_SECRET_KEY', os.environ.get('SECRET_KEY'))
-if not SECRET_KEY:
-    raise ImproperlyConfigured("SECRET_KEY is missing. Set it in Secrets Manager or environment variables.")
+    value = SECRETS[key_name]
 
-# DEBUG: Default to False if not set
-DEBUG = os.environ.get('DEBUG', 'False').lower() == 'true'
+    if is_bool:
+        if isinstance(value, bool): return value 
+        return value.lower() in ['true', '1', 't', 'y', 'yes']
+    if is_int:
+        try:
+            return int(value)
+        except ValueError:
+            raise ImproperlyConfigured(f"Setting '{key_name}' (value: '{value}') must be an integer.")
+    if is_list:
+        if isinstance(value, list): return value # if already list (e.g. from direct JSON array)
+        if not value: return [] # Handle empty string for lists
+        return [item.strip() for item in value.split(',') if item.strip()]
+    return value
 
-# ALLOWED_HOSTS: Fetch from secrets, fallback to env var, default to empty list (or localhost for dev)
-ALLOWED_HOSTS_STRING = SECRETS.get(
-    'ALLOWED_HOSTS',
-    os.environ.get('ALLOWED_HOSTS', 'localhost,127.0.0.1' if DEBUG else '') # Safer default for dev
-)
+# --- Core Settings ---
+SECRET_KEY =    get_secret('DJANGO_SECRET_KEY')
+DEBUG = os.environ.get('DEBUG')
+
+ALLOWED_HOSTS_STRING = os.environ.get('ALLOWED_HOSTS')
 ALLOWED_HOSTS = [host.strip() for host in ALLOWED_HOSTS_STRING.split(',') if host.strip()]
 if not ALLOWED_HOSTS and not DEBUG:
-     logger.warning("ALLOWED_HOSTS is empty in production!")
-
-ALLOWED_HOSTS = ['*']
+    logger.warning("ALLOWED_HOSTS is empty in production!")
+#ALLOWED_HOSTS = ['*'] # If you intend this, put '*' in your secret or handle it explicitly
 
 # --- Cognito Settings ---
-COGNITO_REGION = SECRETS.get('COGNITO_REGION_NAME', os.environ.get('COGNITO_REGION_NAME')) # Renamed variable
-COGNITO_REGION_NAME = SECRETS.get('COGNITO_REGION_NAME', os.environ.get('COGNITO_REGION_NAME')) # Renamed variable
+COGNITO_REGION = get_secret('COGNITO_REGION_NAME')
+COGNITO_USERPOOL_ID = get_secret('COGNITO_USERPOOL_ID')
+COGNITO_APP_CLIENT_ID = get_secret('COGNITO_APP_CLIENT_ID')
+COGNITO_APP_CLIENT_SECRET = get_secret('COGNITO_APP_CLIENT_SECRET', default_if_not_essential=None) # Optional
 
-COGNITO_USERPOOL_ID = SECRETS.get('COGNITO_USERPOOL_ID', os.environ.get('COGNITO_USERPOOL_ID'))
-COGNITO_APP_CLIENT_ID = SECRETS.get('COGNITO_APP_CLIENT_ID', os.environ.get('COGNITO_APP_CLIENT_ID'))
-# Client Secret likely not needed if using public client + Bearer tokens, but fetch if present/required
-COGNITO_APP_CLIENT_SECRET = SECRETS.get('COGNITO_APP_CLIENT_SECRET', os.environ.get('COGNITO_APP_CLIENT_SECRET', None))
-print(COGNITO_APP_CLIENT_ID)
-# Add warnings if essential Cognito settings are missing
-if not COGNITO_REGION: logger.warning("COGNITO_REGION_NAME not configured.")
-if not COGNITO_USERPOOL_ID: logger.warning("COGNITO_USERPOOL_ID not configured.")
-if not COGNITO_APP_CLIENT_ID: logger.warning("COGNITO_APP_CLIENT_ID not configured.")
-# Warning for secret only if it was expected
-# if not COGNITO_APP_CLIENT_SECRET: logger.warning("COGNITO_APP_CLIENT_SECRET not configured.")
+if not COGNITO_REGION: logger.warning("COGNITO_REGION_NAME not configured (expected from Secrets Manager).")
+if not COGNITO_USERPOOL_ID: logger.warning("COGNITO_USERPOOL_ID not configured (expected from Secrets Manager).")
+if not COGNITO_APP_CLIENT_ID: logger.warning("COGNITO_APP_CLIENT_ID not configured (expected from Secrets Manager).")
 
-
-EXTERNAL_API_KEY = "a3f7b1e9c2d8a4e0f5b3c1a8d0e7f6b2a1d9e8c7b6a5f4e3d2c1b0a9e8d7c6f5"
-EXTERNAL_API_URL = "http://localhost:8000/"
-
-FASTAPI_SERVICE_URL = os.getenv('FASTAPI_SERVICE_URL', 'http://localhost:8000/')
-FASTAPI_API_KEY ="a3f7b1e9c2d8a4e0f5b3c1a8d0e7f6b2a1d9e8c7b6a5f4e3d2c1b0a9e8d7c6f5"
-
-# URL of the service handling LLM generation (e.g., the one with /generate)
-GENERATION_SERVICE_URL = os.getenv('GENERATION_SERVICE_URL','http://localhost:8001/') # IMPORTANT: Set this env var! e.g., http://other-service:8001
-# API Key required by the generation service (might be the same or different)
-GENERATION_API_KEY = os.getenv('GENERATION_API_KEY',EXTERNAL_API_KEY ) # IMPORTANT: Set this env var!
-
-if not FASTAPI_API_KEY:
-    print("WARNING: FASTAPI_API_KEY environment variable is not set. Calls to FastAPI service will likely fail.")
+# --- External Service Settings ---
+SAGEMAKER_ENDPOINT = get_secret('SAGEMAKER_ENDPOINT')
+FASTAPI_SERVICE_URL = os.environ.get('FASTAPI_SERVICE_URL')
+FASTAPI_API_KEY = get_secret('FASTAPI_API_KEY')
+GENERATION_SERVICE_URL = os.environ.get('GENERATION_SERVICE_URL')
+GENERATION_API_KEY = os.environ.get('GENERATION_API_KEY')
 
 # --- AWS S3 Settings ---
-# ** REMOVE EXPLICIT KEYS - Rely on IAM Role **
-# AWS_ACCESS_KEY_ID = None
-# AWS_SECRET_ACCESS_KEY = None
-
-AWS_STORAGE_BUCKET_NAME = SECRETS.get('AWS_STORAGE_BUCKET_NAME', os.environ.get('AWS_STORAGE_BUCKET_NAME'))
-AWS_S3_REGION_NAME = SECRETS.get('AWS_S3_REGION_NAME', os.environ.get('AWS_S3_REGION_NAME')) # Can often be same as Cognito region
-
-if not AWS_STORAGE_BUCKET_NAME: logger.warning("AWS_STORAGE_BUCKET_NAME not configured.")
-if not AWS_S3_REGION_NAME: logger.warning("AWS_S3_REGION_NAME not configured.")
-AWS_STORAGE_BUCKET_NAME = "guruaibucket"
-AWS_S3_SIGNATURE_VERSION = 's3v4'
-AWS_S3_ADDRESSING_STYLE = "virtual"
+AWS_STORAGE_BUCKET_NAME = get_secret('AWS_STORAGE_BUCKET_NAME')
+AWS_S3_REGION_NAME = get_secret('AWS_S3_REGION_NAME')
+AWS_S3_SIGNATURE_VERSION = get_secret('AWS_S3_SIGNATURE_VERSION', default_if_not_essential='s3v4')
+AWS_S3_ADDRESSING_STYLE = get_secret('AWS_S3_ADDRESSING_STYLE', default_if_not_essential="virtual")
 
 # --- Application definition ---
 INSTALLED_APPS = [
@@ -129,7 +126,6 @@ INSTALLED_APPS = [
     'django.contrib.contenttypes',
     'django.contrib.sessions',
     'django.contrib.messages',
-    'django.contrib.staticfiles',
     'rest_framework',
     'corsheaders',
     'apps.users',
@@ -140,20 +136,20 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
-    'corsheaders.middleware.CorsMiddleware', # Place CORS middleware high up
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
-    #'django.middleware.csrf.CsrfViewMiddleware',
+    # 'django.middleware.csrf.CsrfViewMiddleware', # Typically not needed for token-based APIs
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
-ROOT_URLCONF = 'k7_Guru.urls'
+ROOT_URLCONF = 'k7_Guru.urls' 
 
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [os.path.join(BASE_DIR, 'templates')], # If you need project-level templates
+        'DIRS': [os.path.join(BASE_DIR, 'templates')],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -166,163 +162,137 @@ TEMPLATES = [
     },
 ]
 
+WSGI_APPLICATION = 'k7_Guru.wsgi.application' 
 
-WSGI_APPLICATION = 'k7_Guru.wsgi.application'
-
-
-# Database
-# https://docs.djangoproject.com/en/4.2/ref/settings/#databases
-
-DATABASE_URL = os.environ.get('DATABASE_URL')
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL environment variable not set.")
-
+# --- Database Settings ---
 DATABASES = {
-    'default': {  # Remove dj_database_url.config() wrapper
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'guru-db',
-        'USER': 'guruai',
-        'PASSWORD': 'guru_k7group',  # Consider getting this from secrets/env vars too!
-        'HOST': 'guru-db.cgfo2460yct3.us-east-1.rds.amazonaws.com', # Use the confirmed correct endpoint
-        'PORT': 5432,
+    'default': {
+        'ENGINE': get_secret('DATABASE_ENGINE', default_if_not_essential='django.db.backends.postgresql'),
+        'NAME': get_secret('DATABASE_NAME'),
+        'USER': get_secret('DATABASE_USER'),
+        'PASSWORD': get_secret('DATABASE_PASSWORD'),
+        'HOST': get_secret('DATABASE_HOST'),
+        'PORT': get_secret('DATABASE_PORT', is_int=True, default_if_not_essential='5432'),
     }
 }
 
-
+# --- Authentication ---
+AUTH_USER_MODEL = 'users.CustomUser'
 AUTHENTICATION_BACKENDS = [
-    'apps.users.backends.CognitoAuthenticationBackend', # The class handling token->user and get_user
-    'django.contrib.auth.backends.ModelBackend',      # For admin login / createsuperuser
+    'apps.users.backends.CognitoAuthenticationBackend',
+    'django.contrib.auth.backends.ModelBackend',
 ]
 
-# ... your REST_FRAMEWORK setting (which is already correct) ...
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
-        'apps.users.authentication.CognitoAuthentication', # Correct: Handles Bearer token
-        'rest_framework.authentication.SessionAuthentication', # Keep if admin/browsable API needs session login
-        # Or use 'apps.users.authentication.CsrfExemptSessionAuthentication' if needed for testing
+        'apps.users.authentication.CognitoAuthentication',
+        'rest_framework.authentication.SessionAuthentication',
     ],
     'DEFAULT_PERMISSION_CLASSES': [
-        'rest_framework.permissions.IsAuthenticated', # Correct: Requires successful auth
-        # Remove the authenticator class from here:
-        # 'apps.users.authentication.CognitoAuthentication'
+        'rest_framework.permissions.IsAuthenticated',
     ],
-    # ... other DRF settings ...
 }
 
-# Password validation
-# https://docs.djangoproject.com/en/4.2/ref/settings/#auth-password-validators
-
+# --- Password validation ---
 AUTH_PASSWORD_VALIDATORS = [
-    {
-        'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
-    },
+    {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
+    {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator'},
+    {'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator'},
+    {'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator'},
 ]
 
-# Custom User Model
-AUTH_USER_MODEL = 'users.CustomUser'
+# --- OpenSearch Settings ---
+OPENSEARCH_HOST = get_secret('OPENSEARCH_HOST')
+OPENSEARCH_PORT = get_secret('OPENSEARCH_PORT', is_int=True, default_if_not_essential=443)
+OPENSEARCH_USER = get_secret('OPENSEARCH_USER')
+OPENSEARCH_PASSWORD = get_secret('OPENSEARCH_PASSWORD')
+OPENSEARCH_AUTH = (OPENSEARCH_USER, OPENSEARCH_PASSWORD) # Construct tuple after fetching
 
-# Django REST Framework Settings
+CHUNK_SIZE = os.environ.get('CHUNK_SIZE')
+CHUNK_OVERLAP = os.environ.get('CHUNK_OVERLAP')
 
-OPENSEARCH_HOST = 'vpc-guruvectordb-qcasgprbdyout4otbqqkuklwdi.us-east-1.es.amazonaws.com'
-OPENSEARCH_PORT = 443
-OPENSEARCH_AUTH = ('Guruai', 'Guru_ai1')
+LANGUAGE_CODE = get_secret('LANGUAGE_CODE', default_if_not_essential='en-us')
+TIME_ZONE = get_secret('TIME_ZONE', default_if_not_essential='UTC')
+USE_I18N = get_secret('USE_I18N', is_bool=True, default_if_not_essential=True)
+USE_TZ = get_secret('USE_TZ', is_bool=True, default_if_not_essential=True)
 
-CHUNK_SIZE = 900
-CHUNK_OVERLAP = 200
-
-# Internationalization
-# https://docs.djangoproject.com/en/4.2/topics/i18n/
-
-LANGUAGE_CODE = 'en-us'
-TIME_ZONE = 'UTC'
-USE_I18N = True
-USE_TZ = True
-
-
-# Static files (CSS, JavaScript, Images)
-# https://docs.djangoproject.com/en/4.2/howto/static-files/
-
-STATIC_URL = 'static/'
-# Add STATIC_ROOT for collectstatic in production
-# STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
-# Add STATICFILES_DIRS if you have project-level static files
-# STATICFILES_DIRS = [os.path.join(BASE_DIR, 'static')]
-
-
-# Default primary key field type
-# https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
-
-DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
-
-AWS_STORAGE_BUCKET_NAME = SECRETS.get('AWS_STORAGE_BUCKET_NAME', os.environ.get('AWS_STORAGE_BUCKET_NAME'))
-AWS_S3_REGION_NAME = SECRETS.get('AWS_S3_REGION_NAME', os.environ.get('AWS_S3_REGION_NAME'))
-
-if not AWS_STORAGE_BUCKET_NAME:
-    logger.warning("AWS_STORAGE_BUCKET_NAME not configured.")
-if not AWS_S3_REGION_NAME:
-     logger.warning("AWS_S3_REGION_NAME not configured. Boto3 might use default region.")
-
-
-AWS_S3_SIGNATURE_VERSION = 's3v4'
-AWS_S3_ADDRESSING_STYLE = "virtual"
+# --- Default primary key field type ---
+DEFAULT_AUTO_FIELD = get_secret('DEFAULT_AUTO_FIELD', default_if_not_essential='django.db.models.BigAutoField')
 
 # --- CORS Headers Settings ---
-CORS_ALLOWED_ORIGINS_STRING = os.environ.get('CORS_ALLOWED_ORIGINS', '')
+CORS_ALLOWED_ORIGINS_STRING = os.environ.get('CORS_ALLOWED_ORIGINS')
 CORS_ALLOWED_ORIGINS = [origin.strip() for origin in CORS_ALLOWED_ORIGINS_STRING.split(',') if origin.strip()]
-# CORS_ALLOW_ALL_ORIGINS = os.environ.get('CORS_ALLOW_ALL_ORIGINS', 'False').lower() == 'true'
-CORS_ALLOW_CREDENTIALS = True
-AWS_STORAGE_BUCKET_NAME = "guruaibucket"
+# If you want to allow all origins (e.g. for development or public API), you'd set CORS_ALLOW_ALL_ORIGINS=True
+# CORS_ALLOW_ALL_ORIGINS = get_secret('CORS_ALLOW_ALL_ORIGINS', is_bool=True, default_if_not_essential=False)
+# if CORS_ALLOW_ALL_ORIGINS:
+#     logger.warning("CORS_ALLOW_ALL_ORIGINS is True. This allows requests from any origin.")
+# elif not CORS_ALLOWED_ORIGINS:
+#     logger.warning("CORS_ALLOWED_ORIGINS is not set and CORS_ALLOW_ALL_ORIGINS is False. CORS might block requests.")
 
+CORS_ALLOW_CREDENTIALS = os.environ.get("CORS_ALLOW_CREDENTIALS", "False").lower() == "true"
 
-# --- Logging ---
+# --- Logging Configuration (Full) ---
+# Ensure this is after DEBUG is set, as it might influence default log levels
 LOGGING = {
-    # ... (keep as before or enhance) ...
-     'version': 1,
+    'version': 1,
     'disable_existing_loggers': False,
+    'formatters': {
+        'verbose': {
+            'format': '{levelname} {asctime} {module} {process:d} {thread:d} {message}',
+            'style': '{',
+        },
+        'simple': {
+            'format': '{levelname} {message}',
+            'style': '{',
+        },
+    },
     'handlers': {
         'console': {
             'class': 'logging.StreamHandler',
+            'formatter': 'simple', # Or 'verbose'
         },
     },
     'root': {
         'handlers': ['console'],
-        'level': 'INFO',
+        'level': 'INFO', # Base level
     },
     'loggers': {
         'django': {
             'handlers': ['console'],
-            'level': os.getenv('DJANGO_LOG_LEVEL', 'INFO'),
+            'level': os.environ.get('DJANGO_LOG_LEVEL').upper(),
             'propagate': False,
         },
         'apps': {
-             'handlers': ['console'],
-             'level': 'INFO', # Set to DEBUG for app-level debugging
-             'propagate': True,
-        },
-         'boto3': {
             'handlers': ['console'],
-            'level': 'WARNING', # Reduce boto3 noise unless debugging AWS calls
+            'level': os.environ.get('APP_LOG_LEVEL').upper(),
+            'propagate': True,
+        },
+        'boto3': {
+            'handlers': ['console'],
+            'level': os.environ.get('BOTO3_LOG_LEVEL').upper(),
             'propagate': True,
         },
         'botocore': {
             'handlers': ['console'],
-            'level': 'WARNING',
+            'level': os.environ.get('BOTOCORE_LOG_LEVEL').upper(),
             'propagate': True,
         },
-        # Add logger specific to secrets fetching
-        __name__: { # Logger for settings.py itself
-             'handlers': ['console'],
-             'level': 'INFO',
-             'propagate': False,
-         }
+        __name__: {
+            'handlers': ['console'],
+            'level': 'INFO', 
+            'propagate': False,
+        }
     },
 }
+
+# Reconfigure logging with the full settings
+import logging.config
+logging.config.dictConfig(LOGGING)
+logger.info("Full logging configuration applied.")
+
+# Sanity check after all settings are loaded
+logger.info(f"DEBUG mode is: {DEBUG}")
+if not ALLOWED_HOSTS and not DEBUG:
+    logger.error("CRITICAL: ALLOWED_HOSTS is empty in a production (non-DEBUG) environment!")
+    # Consider raising ImproperlyConfigured here if this is a strict production requirement
+    raise ImproperlyConfigured("ALLOWED_HOSTS cannot be empty in production.")
